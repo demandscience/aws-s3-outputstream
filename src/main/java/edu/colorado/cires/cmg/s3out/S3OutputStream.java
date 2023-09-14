@@ -5,6 +5,7 @@ import java.io.OutputStream;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingDeque;
 import org.slf4j.Logger;
@@ -41,6 +42,7 @@ public class S3OutputStream extends OutputStream {
     private int partSizeMib = MIN_PART_SIZE_MIB;
     private boolean autoComplete = true;
     private int uploadQueueSize = 1;
+    private Logger appLogger;
 
     private Builder() {
 
@@ -156,6 +158,16 @@ public class S3OutputStream extends OutputStream {
     }
 
     /**
+     * A logger specific to the application this library is being used
+     * @param appLogger Logger
+     * @return this Builder
+     */
+    public Builder appLogger(Logger appLogger){
+      this.appLogger = appLogger;
+      return this;
+    }
+
+    /**
      * Builds a new {@link S3OutputStream}
      *
      * @return a new {@link S3OutputStream}
@@ -170,7 +182,7 @@ public class S3OutputStream extends OutputStream {
       } else {
         request = MultipartUploadRequest.builder().bucket(bucket).key(key).build();
       }
-      return new S3OutputStream(s3, request, partSizeMib * MiB, autoComplete, uploadQueueSize);
+      return new S3OutputStream(s3, request, partSizeMib * MiB, autoComplete, uploadQueueSize, appLogger);
     }
   }
 
@@ -187,9 +199,18 @@ public class S3OutputStream extends OutputStream {
   private boolean complete;
   private boolean closed;
 
+  private int bytesUploaded;
+
+  private Logger appLogger;
 
   S3OutputStream(S3ClientMultipartUpload s3, MultipartUploadRequest uploadRequest, int maxBufferSize, boolean autoComplete,
-      int queueSize) {
+                 int queueSize) {
+    this(s3, uploadRequest, maxBufferSize, autoComplete, queueSize, null);
+  }
+
+  S3OutputStream(S3ClientMultipartUpload s3, MultipartUploadRequest uploadRequest, int maxBufferSize, boolean autoComplete,
+      int queueSize, Logger appLogger) {
+    this.appLogger = appLogger;
     this.uploadQueue = new LinkedBlockingDeque<>(queueSize);
     this.s3 = s3;
     this.bucket = uploadRequest.getBucket();
@@ -200,6 +221,13 @@ public class S3OutputStream extends OutputStream {
     newBuffer();
     consumer = new Thread(new UploadConsumer());
     consumer.start();
+    logToAppLogger("Starting S3 multi-part upload ID [{}] for s3://{}/{}", uploadId, bucket, key);
+  }
+
+  private void logToAppLogger(String logMessage, Object... s){
+    if(this.appLogger != null){
+      this.appLogger.debug(logMessage, s);
+    }
   }
 
   private void newBuffer() {
@@ -230,7 +258,17 @@ public class S3OutputStream extends OutputStream {
           }
           synchronized (completedParts) {
             int partNumber = completedParts.size() + 1;
-            completedParts.add(s3.uploadPart(bucket, key, uploadId, partNumber, buffer.getBuffer()));
+            ByteBuffer byteBuffer = buffer.getBuffer();
+            int byteLength = byteBuffer.remaining();
+            bytesUploaded += byteLength;
+            logToAppLogger("Sending S3 multi-part upload ID [{}] (part {}) for s3://{}/{}: {} byte{}",
+                    uploadId,
+                    partNumber,
+                    bucket,
+                    key,
+                    byteLength,
+                    byteLength == 1 ? "" : "s");
+            completedParts.add(s3.uploadPart(bucket, key, uploadId, partNumber, byteBuffer));
           }
         }
       } catch (InterruptedException e) {
@@ -265,12 +303,24 @@ public class S3OutputStream extends OutputStream {
 
   private void complete() {
     synchronized (completedParts) {
+      logToAppLogger("Completed S3 multi-part upload ID [{}] ({} part{}) for s3://{}/{}: {} byte{}",
+              uploadId,
+              completedParts.size(),
+              completedParts.size() == 1 ? "" : "s",
+              bucket,
+              key,
+              bytesUploaded,
+              bytesUploaded == 1 ? "" : "s");
       s3.completeMultipartUpload(bucket, key, uploadId, completedParts);
     }
   }
 
   private void abort() {
     try {
+      logToAppLogger("Aborted S3 multi-part upload ID [{}] for s3://{}/{}",
+              uploadId,
+              bucket,
+              key);
       s3.abortMultipartUpload(bucket, key, uploadId);
     } catch (Exception e) {
       LOGGER.warn("An error occurred aborting multipart upload: " + bucket + ":" + key, e);
